@@ -1,0 +1,6 @@
+{
+  "_comment": "Optional. Place at project root as .mcp-make-config.json",
+  "deny": ["clean-volumes", "seed-prod"],
+  "allow": null,
+  "envAllowlist": null
+}

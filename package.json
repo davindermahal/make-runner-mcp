@@ -1,0 +1,13 @@
+{
+  "name": "make-runner-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Scoped MCP server exposing only make up / make test / make composer for a project.",
+  "main": "server.js",
+  "bin": {
+    "make-runner-mcp": "./server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0"
+  }
+}
