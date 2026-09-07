@@ -129,7 +129,7 @@ make-runner-mcp always blocks target names containing `deploy`, `destroy`,
 find every target name and flag likely false positives:
 
 ```bash
-grep -hoE '^[A-Za-z0-9][A-Za-z0-9_.-]*:' Makefile | sed 's/:$//' | sort -u | while read -r t; do
+grep -hoE '^[A-Za-z0-9][A-Za-z0-9_.-]*:($|[^=])' Makefile | sed 's/:.*//' | sort -u | while read -r t; do
   norm=$(echo "$t" | tr -d '_.-' | tr '[:upper:]' '[:lower:]')
   case "$norm" in
     *deploy*|*destroy*|*prod*|*publish*|*release*)
@@ -140,6 +140,12 @@ grep -hoE '^[A-Za-z0-9][A-Za-z0-9_.-]*:' Makefile | sed 's/:$//' | sort -u | whi
   esac
 done
 ```
+
+(The `:($|[^=])` — colon followed by end-of-line or a non-`=` character — is
+deliberate, not decoration: it's what keeps a variable assignment like
+`RELEASE_TAG := v1.0.0` from being misread as a target named `RELEASE_TAG`
+and wrongly flagged here. A plain `name:` pattern would catch that false
+positive whenever there's no space before `:=`.)
 
 For every line this prints: **do not rename the target yourself.** Decide
 only whether it's a correct block (a real deploy/destroy/publish/release
@@ -167,7 +173,7 @@ need to override that variable.
 ## 7. Backfill missing or oversized descriptions
 
 ```bash
-grep -nE '^[A-Za-z0-9][A-Za-z0-9_.-]*:' Makefile | grep -v '##'
+grep -nE '^[A-Za-z0-9][A-Za-z0-9_.-]*:($|[^=])' Makefile | grep -v '##'
 ```
 
 Every line this prints is a target with no `##` comment — it will show up
