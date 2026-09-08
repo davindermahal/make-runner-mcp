@@ -31,25 +31,57 @@ inspector below):
 npm install
 ```
 
+## Two ways to run this — pick based on whether your agent is sandboxed
+
+**`MCP_TRANSPORT=http` is the default.** This is a breaking change from
+earlier versions, which defaulted to `stdio`: a client config that spawns
+this as a subprocess expecting a stdio handshake (the old default) now
+needs `MCP_TRANSPORT: "stdio"` added to its `env` block explicitly, or
+it'll get an HTTP server trying to bind a port instead of speaking MCP
+over its own stdin/stdout.
+
+- **`stdio` (opt-in)** — the client spawns this as a subprocess and speaks
+  MCP over its stdin/stdout. Simplest option: no port, no token, no
+  process to manage yourself. Use this for direct, unsandboxed use — an
+  agent running with normal access to your machine. See
+  [Client configs (stdio)](#client-configs-stdio) below.
+- **`http` (default)** — this runs as its own persistent process, with
+  clients connecting to it over the network instead of spawning it. Use
+  this when the calling agent runs inside its own sandbox (e.g. Gemini
+  CLI's `--sandbox`): a sandboxed agent that spawns an MCP server via
+  `stdio` spawns it *inside its own sandbox container*, which means the
+  server (and anything it shells out to, e.g. `docker`) only has whatever
+  access that container has — typically none, and giving it more (like a
+  mounted Docker socket) hands that same access to the agent's own native
+  shell tool too, since the sandbox isn't scoped per-tool. Running this
+  server outside the sandbox instead, reached only over the network, means
+  the sandbox never needs Docker access at all — only this server does,
+  and it only ever runs the target you named. See
+  [Running as a persistent HTTP server](#running-as-a-persistent-http-server-for-a-sandboxed-agent)
+  below — this is a real, verified pattern, not a theoretical one.
+
 ## Verify it works standalone
 
 ```bash
-npx @modelcontextprotocol/inspector node server.js
+MCP_TRANSPORT=stdio npx @modelcontextprotocol/inspector node server.js
 ```
 
 This opens a local UI to list tools and call them directly, useful for
 confirming the Makefile parsing looks right before wiring it into an agent.
 
-## Client configs
+## Client configs (stdio)
 
 The server is the same everywhere — only the config file and its shape
-differ per client. Two things change between projects/teams:
+differ per client. Things that change between projects/teams:
 
 - `PROJECT_DIR` — the target project's root.
 - `#v1.0.1` — bump this to whatever tag you've actually released. Always
   pin to a release tag, never `#main`: for a tool that executes commands,
   an unpinned branch reference means a bad push could silently change what
   runs on everyone's machine.
+- `MCP_TRANSPORT: "stdio"` — required in every block below, since `http`
+  is now the default and a stdio-spawned subprocess needs to opt back in
+  explicitly.
 
 ### Gemini CLI
 `.gemini/settings.json` (project) or `~/.gemini/settings.json` (user-wide):
@@ -59,7 +91,7 @@ differ per client. Two things change between projects/teams:
     "makeRunner": {
       "command": "npx",
       "args": ["-y", "github:davindermahal/make-runner-mcp#v1.0.1"],
-      "env": { "PROJECT_DIR": "/path/to/project" }
+      "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
 }
@@ -73,12 +105,12 @@ Project-level `.mcp.json` at the repo root (checked in, shared with the team):
     "makeRunner": {
       "command": "npx",
       "args": ["-y", "github:davindermahal/make-runner-mcp#v1.0.1"],
-      "env": { "PROJECT_DIR": "/path/to/project" }
+      "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
 }
 ```
-Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -- npx -y github:davindermahal/make-runner-mcp#v1.0.1`
+Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -e MCP_TRANSPORT=stdio -- npx -y github:davindermahal/make-runner-mcp#v1.0.1`
 
 ### Claude Desktop
 `claude_desktop_config.json` (Settings → Developer → Edit Config):
@@ -88,7 +120,7 @@ Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -- np
     "makeRunner": {
       "command": "npx",
       "args": ["-y", "github:davindermahal/make-runner-mcp#v1.0.1"],
-      "env": { "PROJECT_DIR": "/path/to/project" }
+      "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
 }
@@ -102,7 +134,7 @@ Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -- np
     "makeRunner": {
       "command": "npx",
       "args": ["-y", "github:davindermahal/make-runner-mcp#v1.0.1"],
-      "env": { "PROJECT_DIR": "/path/to/project" }
+      "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
 }
@@ -111,8 +143,68 @@ Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -- np
 ### Any other MCP-compatible client
 All of these follow the same `command` / `args` / `env` shape because it's
 part of the MCP spec's stdio transport — if a client supports MCP at all,
-this same block (adjusted to that client's config file location) will work
-without touching the server itself.
+this same block (adjusted to that client's config file location, with
+`MCP_TRANSPORT: "stdio"` added to `env`) will work without touching the
+server itself.
+
+## Running as a persistent HTTP server (for a sandboxed agent)
+
+Verified end to end against a real sandboxed `gemini --sandbox` session
+driving a real Docker-based project (PHPUnit and Composer both ran inside
+the project's container, through this server, with the sandbox itself
+having no `docker` CLI or socket at all — the model's own native shell
+tool inside that same session had zero Docker access, confirmed with
+`which docker` returning nothing).
+
+**1. Run the server as its own process**, outside any sandbox, with
+normal access to whatever the project's targets need (Docker included —
+nothing special, just however you'd normally run `docker`/`docker compose`
+on this machine):
+
+```bash
+PROJECT_DIR=/path/to/project \
+MCP_HTTP_TOKEN=$(openssl rand -hex 24) \
+MCP_HTTP_PORT=8791 \
+npx -y github:davindermahal/make-runner-mcp#v1.0.1
+```
+
+Generate a real random token (`openssl rand -hex 24` or equivalent) and
+keep it — the server refuses to start without one (fails closed, not
+silently unauthenticated), and every client needs it to connect. Keep
+this process running for as long as you want the tool available; it's not
+spawned per-client the way `stdio` mode is.
+
+**2. Point the client at it over the network, not a subprocess spawn.**
+For a client whose agent itself runs sandboxed (Gemini's `--sandbox`,
+which auto-maps `host.docker.internal` to the host — verified live, zero
+extra network config needed), use that hostname so the sandboxed process
+can reach a server running on the host:
+
+```json
+{
+  "mcpServers": {
+    "makeRunner": {
+      "url": "http://host.docker.internal:8791/mcp",
+      "type": "http",
+      "headers": { "Authorization": "Bearer <the token from step 1>" }
+    }
+  }
+}
+```
+
+For an unsandboxed client on the same machine as the server, `127.0.0.1`
+works the same as any other local service.
+
+**Security notes specific to this mode** (also see
+[Risks and limitations](#risks-and-limitations)):
+
+- `MCP_HTTP_HOST` defaults to `0.0.0.0` — reachable from your local
+  network, not just the sandbox, unless your host firewall restricts it.
+  The bearer token is the actual access control; treat it like any other
+  credential (don't commit it, don't reuse it across machines/projects).
+- Every project you run this way needs its own token and, generally, its
+  own port — there's no per-project isolation beyond that; anyone who has
+  the token for a given running instance can call any tool it exposes.
 
 ## Publishing to npm instead
 
@@ -205,6 +297,13 @@ restriction at all.
 access. It does not eliminate it, and it is not a security product.**
 Read this before pointing it at anything you'd be upset to lose or break.
 
+- **HTTP mode opens a network port that can execute commands.** It's
+  authenticated (a required bearer token, fails closed if unset) but bound
+  to `0.0.0.0` by default — reachable from anything that can route to that
+  port, not just your intended sandboxed agent, unless your host firewall
+  restricts it. On a shared network, either firewall the port or bind
+  `MCP_HTTP_HOST` more narrowly. The token is the real access control;
+  don't commit it, don't log it, don't reuse one across machines/projects.
 - **It's only as safe as your Makefile.** The built-in denylist blocks
   five words (`deploy`, `destroy`, `prod`, `publish`, `release`) and a
   `rm-` prefix — it does not evaluate whether a target is actually
@@ -282,26 +381,35 @@ inspection, not just reading the final answer), because it changes what
   even though it looks like it should be. Without that trust, make-runner-mcp
   is silently never loaded at all (see the point above for what happens
   next).
-- **`--sandbox` mode and Docker-based targets don't mix.** Gemini's
-  `--sandbox` re-execs itself (and everything it spawns, MCP servers
-  included) inside its own container. The default sandbox image
-  (`gemini-cli/sandbox`) does not include the `docker` CLI at all —
-  a target that shells out to `docker`/`docker compose` fails with
-  `make: docker: No such file or directory`, verified verbatim. Making
-  that work would require a custom sandbox image with `docker` installed
-  and the host's Docker socket mounted in — but Gemini's sandbox is one
-  shared container for the entire session, not scoped per-tool. I
-  confirmed the native `run_shell_command` fallback above runs inside that
-  *same* sandbox container. So mounting the docker socket in to make
-  make-runner-mcp's targets work would also hand Gemini's own unrestricted
-  native shell tool the identical socket access, in the same container,
-  with no separation between "the vetted make targets" and "whatever
-  command the model decides to run directly." That's the exact
-  Docker-out-of-Docker exposure this project exists to avoid (see
-  `CLAUDE.md`) — routing through make-runner-mcp adds no protection in
-  that configuration. There is no config that gets you both a sandboxed
-  Gemini session and Docker access scoped to only make-runner-mcp's
-  targets; running Docker-based targets means either running Gemini
-  unsandboxed (and relying on make-runner-mcp's own validation as the real
-  boundary, which is what it's built for), or accepting that `--sandbox` +
-  a mounted docker socket gives the whole session unscoped Docker access.
+- **`--sandbox` mode and `stdio`-spawned Docker-based targets don't mix —
+  this is exactly why `http` is now the default transport.** Gemini's
+  `--sandbox` re-execs itself (and everything it spawns via `stdio`, MCP
+  servers included) inside its own container. The default sandbox image
+  (`gemini-cli/sandbox`) does not include the `docker` CLI at all — a
+  `stdio`-spawned target that shells out to `docker`/`docker compose`
+  fails with `make: docker: No such file or directory`, verified verbatim.
+  The tempting-looking fix — a custom sandbox image with `docker` CLI
+  installed and the host's Docker socket mounted in — doesn't actually
+  preserve any scoping: Gemini's sandbox is one shared container for the
+  entire session, not scoped per-tool, and the native `run_shell_command`
+  fallback (previous bullet) runs inside that *same* container. Mounting
+  the socket in would hand that same unrestricted native shell tool
+  identical Docker access, with no separation between "the vetted make
+  targets" and "whatever command the model decides to run directly" — the
+  exact Docker-outside-of-Docker exposure this project exists to avoid
+  (see `CLAUDE.md`).
+
+  **The actual fix, verified end to end**: run this server in `http` mode
+  (the default) *outside* the sandbox — as its own process on the host,
+  with normal Docker access — and let the sandboxed session reach it only
+  over the network via Gemini's auto-mapped `host.docker.internal`. The
+  sandbox container itself then never has Docker access at all — no CLI,
+  no socket — so there's nothing for the native shell tool to fall back
+  *to*, and Docker access exists exclusively through this server's vetted
+  targets. Confirmed live: `mcp_makeRunner_make__unit-test` and
+  `mcp_makeRunner_make__composer` both correctly drove a real project's
+  Docker container (real PHPUnit and Composer output) through a sandboxed
+  session that had zero `docker` CLI of its own (`which docker` returned
+  nothing in that same session). See
+  [Running as a persistent HTTP server](#running-as-a-persistent-http-server-for-a-sandboxed-agent)
+  above for the exact setup.

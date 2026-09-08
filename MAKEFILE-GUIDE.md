@@ -221,8 +221,11 @@ actual server, not just `make` directly:
 cd /path/to/make-runner-mcp
 PROJECT_DIR=/path/to/the/project node -e '
 const { spawn } = require("child_process");
+// MCP_TRANSPORT=stdio is required here: make-runner-mcp defaults to the
+// http transport (for sandboxed-agent use, see its own README), and this
+// probe talks to it over stdin/stdout, not a network port.
 const child = spawn("node", ["server.js"], {
-  env: { ...process.env, PROJECT_DIR: process.env.PROJECT_DIR },
+  env: { ...process.env, PROJECT_DIR: process.env.PROJECT_DIR, MCP_TRANSPORT: "stdio" },
   stdio: ["pipe", "pipe", "pipe"],
 });
 let buf = "";

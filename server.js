@@ -25,6 +25,25 @@
  *   PROJECT_DIR          - project root containing the Makefile (required)
  *   MCP_MAKE_CONFIG       - optional path to a JSON config, default:
  *                           <PROJECT_DIR>/.mcp-make-config.json
+ *   MCP_TRANSPORT         - "http" (default) or "stdio". http is the
+ *                           default because it's the only mode that works
+ *                           correctly when the *calling* agent runs inside
+ *                           its own sandbox: the server runs here, outside
+ *                           any sandbox, with normal access to whatever it
+ *                           needs (e.g. the real Docker daemon), and the
+ *                           agent reaches it only over the network — never
+ *                           via a locally-spawned subprocess, which is what
+ *                           stdio requires and which a sandboxed agent
+ *                           re-execs *inside* its own container (see
+ *                           README's "Running behind a sandbox"). Set
+ *                           MCP_TRANSPORT=stdio to opt back into the
+ *                           simpler subprocess-per-client-config model for
+ *                           direct, unsandboxed use.
+ *   MCP_HTTP_HOST         - http mode only; default 0.0.0.0
+ *   MCP_HTTP_PORT         - http mode only; default 8791
+ *   MCP_HTTP_TOKEN        - http mode only; REQUIRED, no default. The
+ *                           server refuses to start without one — see
+ *                           README for how callers authenticate with it.
  *
  * Config file shape (all fields optional):
  * {
@@ -39,18 +58,36 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 
 const PROJECT_DIR = path.resolve(process.env.PROJECT_DIR || process.cwd());
 const MAKEFILE = path.join(PROJECT_DIR, "Makefile");
 const CONFIG_PATH =
   process.env.MCP_MAKE_CONFIG || path.join(PROJECT_DIR, ".mcp-make-config.json");
+
+// HTTP is the default transport (stdio is the opt-in) specifically so this
+// server runs *outside* a sandboxed agent's own container/filesystem, with
+// the agent reaching it only over the network, never via a locally-spawned
+// subprocess or a mounted socket — see the README's "Running behind a
+// sandbox" section for why that separation matters and what broke without
+// it. Breaking change from earlier versions: a client config that spawns
+// this as a subprocess expecting stdio (the old default) must now set
+// MCP_TRANSPORT=stdio explicitly, or it'll get an HTTP server trying to
+// bind a port instead of a stdio handshake.
+const MCP_TRANSPORT = process.env.MCP_TRANSPORT || "http";
+const MCP_HTTP_HOST = process.env.MCP_HTTP_HOST || "0.0.0.0";
+const MCP_HTTP_PORT = Number(process.env.MCP_HTTP_PORT || 8791);
+const MCP_HTTP_TOKEN = process.env.MCP_HTTP_TOKEN || "";
 const TIMEOUT_MS = 5 * 60 * 1000;
 const KILL_GRACE_MS = 5000;
 const MAX_OUTPUT_BYTES = 200_000;
@@ -127,6 +164,18 @@ const SAFE_VAR_VALUE = /^[A-Za-z0-9 _.,+\/@:^~=-]*$/;
 
 if (!existsSync(MAKEFILE)) {
   console.error(`No Makefile found at ${MAKEFILE}. Set PROJECT_DIR.`);
+  process.exit(1);
+}
+
+if (MCP_TRANSPORT === "http" && !MCP_HTTP_TOKEN) {
+  // Fail closed, loudly, at startup — not on the first request. A network
+  // listener that executes commands with no auth at all is the one mistake
+  // here that isn't recoverable by a later config fix; refuse to bind the
+  // socket rather than start unauthenticated and hope every caller behaves.
+  console.error("MCP_TRANSPORT=http requires MCP_HTTP_TOKEN to be set (a long random string). Refusing to start unauthenticated.");
+  process.exit(1);
+} else if (MCP_TRANSPORT !== "http" && MCP_TRANSPORT !== "stdio") {
+  console.error(`Unknown MCP_TRANSPORT '${MCP_TRANSPORT}'. Use 'stdio' (default) or 'http'.`);
   process.exit(1);
 }
 
@@ -241,15 +290,21 @@ function parseTargetsInto(filePath, targets, visited, depth) {
       continue;
     }
 
-    // Matched against the rule part only (everything before a `##`
-    // comment, if any) — the trailing `[^=]*` here exists to rule out
-    // plain variable assignments like `FOO = bar`, but matching it against
-    // the *whole* line would also reject genuine targets whose comment
-    // text happens to contain "=" (e.g. `## e.g. ARGS="install ..."`),
+    // Matched against the rule part only (everything before make's own
+    // comment character, `#` — not specifically `##`; make itself treats
+    // a single unescaped `#` as starting a comment on a rule line, and
+    // plenty of real Makefiles use single-`#` descriptions rather than
+    // this project's own `##` convention). The trailing `[^=]*` below
+    // exists to rule out plain variable assignments like `FOO = bar`, but
+    // matching it against the *whole* line — comment included — would
+    // also reject any genuine target whose trailing comment happens to
+    // contain "=" (e.g. `# usage: make composer ARGS="require ..."`),
     // which is exactly the kind of comment the ARGS passthrough
-    // convention (see README) encourages people to write.
-    const hashIdx = line.indexOf("##");
-    const rulePart = hashIdx === -1 ? line : line.slice(0, hashIdx);
+    // convention (see README) encourages people to write. `\#` is treated
+    // as an escaped, literal `#` (matching make's own escaping), not a
+    // comment start.
+    const hashMatch = line.match(/(?<!\\)#/);
+    const rulePart = hashMatch ? line.slice(0, hashMatch.index) : line;
 
     const m = rulePart.match(/^([A-Za-z0-9][A-Za-z0-9_.-]*)\s*:(?!=)(?:[^=]*)$/);
     if (!m) continue;
@@ -407,85 +462,188 @@ function runMake(targetArgs, label, config) {
   });
 }
 
-const server = new Server(
-  { name: "make-runner", version: "2.0.0" },
-  { capabilities: { tools: {} } }
-);
+// A fresh Server instance per connection, not a shared singleton — the SDK's
+// Server/Protocol object represents one connected session (this is implicit
+// in stdio, where there's inherently only ever one client, but explicit
+// once there can be several concurrent HTTP sessions: reusing one Server
+// across multiple transport.connect() calls produces "Server already
+// initialized" on the second session's handshake). Cheap to construct —
+// all the real state (Makefile/config) is re-read fresh on every request
+// regardless, per the re-parse-on-every-call design above — so there's no
+// cost to this beyond the one-time setup below.
+function createServer() {
+  const server = new Server(
+    { name: "make-runner", version: "2.0.0" },
+    { capabilities: { tools: {} } }
+  );
 
-// Both handlers below are wrapped in try/catch as a last line of defense:
-// no single bad input (a malformed config, an unreadable include, or a bug
-// we haven't thought of) should be able to take down every future request.
-// Fail closed — log the real error server-side, tell the caller nothing
-// more than "rejected"/"no tools" — rather than let an exception propagate
-// as a raw JSON-RPC error that both breaks subsequent calls and can leak
-// internal detail back to the caller.
+  // Both handlers below are wrapped in try/catch as a last line of defense:
+  // no single bad input (a malformed config, an unreadable include, or a bug
+  // we haven't thought of) should be able to take down every future request.
+  // Fail closed — log the real error server-side, tell the caller nothing
+  // more than "rejected"/"no tools" — rather than let an exception propagate
+  // as a raw JSON-RPC error that both breaks subsequent calls and can leak
+  // internal detail back to the caller.
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  try {
-    const config = loadConfig();
-    const targets = parseTargets();
-    const tools = buildToolEntries(targets, config).map(({ targetName, toolName, description }) => ({
-      name: toolName,
-      description: `${description} (make target: ${targetName})`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          args: {
-            type: "array",
-            items: { type: "string" },
-            description: "Optional extra make flags and/or VAR=value pairs (e.g. ARGS=\"install symfony/console --no-dev\" for a target whose recipe uses $(ARGS)). No bare positional arguments — those would be treated as additional build goals.",
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    try {
+      const config = loadConfig();
+      const targets = parseTargets();
+      const tools = buildToolEntries(targets, config).map(({ targetName, toolName, description }) => ({
+        name: toolName,
+        description: `${description} (make target: ${targetName})`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            args: {
+              type: "array",
+              items: { type: "string" },
+              description: "Optional extra make flags and/or VAR=value pairs (e.g. ARGS=\"install symfony/console --no-dev\" for a target whose recipe uses $(ARGS)). No bare positional arguments — those would be treated as additional build goals.",
+            },
           },
+          additionalProperties: false,
         },
-        additionalProperties: false,
-      },
-    }));
-    return { tools };
-  } catch (err) {
-    console.error(`ListTools failed: ${err.stack || err.message}`);
-    return { tools: [] };
-  }
-});
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  try {
-    const { name: toolName, arguments: callArgs = {} } = request.params;
-
-    // Re-parse fresh on every call — never trust a cached mapping, so a
-    // Makefile edited between listing and calling can't be exploited to
-    // sneak a now-denied target through under an old tool name.
-    const config = loadConfig();
-    const targets = parseTargets();
-
-    const match = buildToolEntries(targets, config).find((t) => t.toolName === toolName);
-    if (!match) {
-      return {
-        content: [{ type: "text", text: `Rejected: '${toolName}' is not a currently allowed target.` }],
-        isError: true,
-      };
+      }));
+      return { tools };
+    } catch (err) {
+      console.error(`ListTools failed: ${err.stack || err.message}`);
+      return { tools: [] };
     }
+  });
 
-    const extra = callArgs.args || [];
-    for (const a of extra) {
-      const err = validateArg(a);
-      if (err) {
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    try {
+      const { name: toolName, arguments: callArgs = {} } = request.params;
+
+      // Re-parse fresh on every call — never trust a cached mapping, so a
+      // Makefile edited between listing and calling can't be exploited to
+      // sneak a now-denied target through under an old tool name.
+      const config = loadConfig();
+      const targets = parseTargets();
+
+      const match = buildToolEntries(targets, config).find((t) => t.toolName === toolName);
+      if (!match) {
         return {
-          content: [{ type: "text", text: `Rejected: ${err}.` }],
+          content: [{ type: "text", text: `Rejected: '${toolName}' is not a currently allowed target.` }],
           isError: true,
         };
       }
+
+      const extra = callArgs.args || [];
+      for (const a of extra) {
+        const err = validateArg(a);
+        if (err) {
+          return {
+            content: [{ type: "text", text: `Rejected: ${err}.` }],
+            isError: true,
+          };
+        }
+      }
+
+      // -f pins make to exactly the file we parsed and vetted `match` against
+      // — no argument path (allowlisted or not) can override this.
+      return await runMake(["-f", MAKEFILE, match.targetName, ...extra], `target: ${match.targetName}`, config);
+    } catch (err) {
+      console.error(`CallTool failed: ${err.stack || err.message}`);
+      return {
+        content: [{ type: "text", text: "Rejected: internal error handling this request." }],
+        isError: true,
+      };
+    }
+  });
+
+  return server;
+}
+
+if (MCP_TRANSPORT === "http") {
+  // Session id -> transport. A new client (no mcp-session-id header, an
+  // `initialize` request) gets its own fresh Server+Transport pair; every
+  // later request for that session is routed to the same transport, per
+  // the SDK's own documented multi-session pattern (see
+  // examples/server/simpleStreamableHttp.js) — reusing a single
+  // Server/transport across sessions produces "Server already initialized"
+  // on the second session's handshake, since a Server represents one
+  // connected session, not a process-wide singleton.
+  const sessions = new Map();
+
+  const expectedAuth = `Bearer ${MCP_HTTP_TOKEN}`;
+
+  function isAuthorized(req) {
+    const authHeader = req.headers["authorization"] || "";
+    // Constant-time comparison, and a length check first since
+    // timingSafeEqual throws (rather than returning false) on a length
+    // mismatch — a naive `authHeader === expected` would otherwise leak
+    // the token's length via response-time differences.
+    const authBuf = Buffer.from(authHeader);
+    const expectedBuf = Buffer.from(expectedAuth);
+    return authBuf.length === expectedBuf.length && timingSafeEqual(authBuf, expectedBuf);
+  }
+
+  function readJsonBody(req) {
+    return new Promise((resolve, reject) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        if (!raw) return resolve(undefined);
+        try {
+          resolve(JSON.parse(raw));
+        } catch (err) {
+          reject(err);
+        }
+      });
+      req.on("error", reject);
+    });
+  }
+
+  const httpServer = createHttpServer(async (req, res) => {
+    if (!isAuthorized(req)) {
+      res.writeHead(401, { "content-type": "application/json" }).end(
+        JSON.stringify({ error: "unauthorized" })
+      );
+      return;
     }
 
-    // -f pins make to exactly the file we parsed and vetted `match` against
-    // — no argument path (allowlisted or not) can override this.
-    return await runMake(["-f", MAKEFILE, match.targetName, ...extra], `target: ${match.targetName}`, config);
-  } catch (err) {
-    console.error(`CallTool failed: ${err.stack || err.message}`);
-    return {
-      content: [{ type: "text", text: "Rejected: internal error handling this request." }],
-      isError: true,
-    };
-  }
-});
+    const sessionId = req.headers["mcp-session-id"];
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+    try {
+      if (sessionId && sessions.has(sessionId)) {
+        await sessions.get(sessionId).handleRequest(req, res, req.method === "POST" ? await readJsonBody(req) : undefined);
+        return;
+      }
+
+      if (req.method === "POST" && !sessionId) {
+        const body = await readJsonBody(req);
+        if (!isInitializeRequest(body)) {
+          res.writeHead(400, { "content-type": "application/json" }).end(
+            JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null })
+          );
+          return;
+        }
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => sessions.set(sid, transport),
+        });
+        transport.onclose = () => {
+          if (transport.sessionId) sessions.delete(transport.sessionId);
+        };
+        await createServer().connect(transport);
+        await transport.handleRequest(req, res, body);
+        return;
+      }
+
+      res.writeHead(400, { "content-type": "application/json" }).end(
+        JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null })
+      );
+    } catch (err) {
+      console.error(`HTTP transport error: ${err.stack || err.message}`);
+      if (!res.headersSent) res.writeHead(500).end();
+    }
+  });
+
+  httpServer.listen(MCP_HTTP_PORT, MCP_HTTP_HOST, () => {
+    console.error(`make-runner-mcp listening on http://${MCP_HTTP_HOST}:${MCP_HTTP_PORT} (MCP_HTTP_TOKEN required)`);
+  });
+} else {
+  const transport = new StdioServerTransport();
+  await createServer().connect(transport);
+}
