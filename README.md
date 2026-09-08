@@ -256,3 +256,52 @@ If any of this is a dealbreaker for your use case, the honest fix is
 either: don't expose the target in question at all (`deny`/`allow` it
 out), rewrite the target's recipe to be inherently safe regardless of what
 `$(ARGS)` contains, or don't use this tool for that project.
+
+### Gemini CLI specifically — tested, not theoretical
+
+The following was verified against a real `gemini` CLI session (transcript
+inspection, not just reading the final answer), because it changes what
+"safe" means for this tool with that client:
+
+- **When make-runner-mcp fails to connect for any reason, Gemini CLI does
+  not fail loudly.** It silently falls back to its own native `read_file`
+  and `run_shell_command` tools and accomplishes the same task via full,
+  unrestricted shell access — with no clear signal beyond a generic "MCP
+  issues detected" banner that also fires for unrelated, pre-existing
+  broken servers. I triggered this twice, independently: once from an
+  untrusted project folder, once from an unrelated `npm` cache permission
+  error inside `--sandbox`. Both times the model read the Makefile
+  directly and ran the command itself, completely bypassing
+  make-runner-mcp, and the final answer looked identical either way — you
+  cannot tell from the response alone whether the tool boundary was
+  actually enforced. **This means make-runner-mcp's guarantee only holds
+  while the MCP connection is actually up; it does not degrade safely.**
+- **A project folder must be in Gemini CLI's persistent trust store**
+  before it will load *any* project-level `.gemini/settings.json` MCP
+  servers — the `--skip-trust` CLI flag alone is not sufficient for this,
+  even though it looks like it should be. Without that trust, make-runner-mcp
+  is silently never loaded at all (see the point above for what happens
+  next).
+- **`--sandbox` mode and Docker-based targets don't mix.** Gemini's
+  `--sandbox` re-execs itself (and everything it spawns, MCP servers
+  included) inside its own container. The default sandbox image
+  (`gemini-cli/sandbox`) does not include the `docker` CLI at all —
+  a target that shells out to `docker`/`docker compose` fails with
+  `make: docker: No such file or directory`, verified verbatim. Making
+  that work would require a custom sandbox image with `docker` installed
+  and the host's Docker socket mounted in — but Gemini's sandbox is one
+  shared container for the entire session, not scoped per-tool. I
+  confirmed the native `run_shell_command` fallback above runs inside that
+  *same* sandbox container. So mounting the docker socket in to make
+  make-runner-mcp's targets work would also hand Gemini's own unrestricted
+  native shell tool the identical socket access, in the same container,
+  with no separation between "the vetted make targets" and "whatever
+  command the model decides to run directly." That's the exact
+  Docker-out-of-Docker exposure this project exists to avoid (see
+  `CLAUDE.md`) — routing through make-runner-mcp adds no protection in
+  that configuration. There is no config that gets you both a sandboxed
+  Gemini session and Docker access scoped to only make-runner-mcp's
+  targets; running Docker-based targets means either running Gemini
+  unsandboxed (and relying on make-runner-mcp's own validation as the real
+  boundary, which is what it's built for), or accepting that `--sandbox` +
+  a mounted docker socket gives the whole session unscoped Docker access.
