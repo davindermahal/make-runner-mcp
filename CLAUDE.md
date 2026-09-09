@@ -53,11 +53,16 @@ Ship via GitHub, not npm, to start — lowest friction for the team:
 - npm publishing is a possible later step (marginally faster resolution,
   no GitHub dependency) but isn't required to ship this.
 
-## Next steps (for whoever/whatever picks this up)
+## Releasing
 
-1. `git init`, commit these files.
-2. Create a GitHub repo (public) and push.
-3. Replace the `yourorg/...` placeholders in `README.md`'s config
-   snippets with the real repo path.
-4. `git tag v1.0.0 && git push --tags`.
-5. Share the README's config block with the team.
+Not published to npm — distributed only via a GitHub release tag
+(`npx github:davindermahal/make-runner-mcp#v<tag>`), per the distribution
+plan above. There's no CI workflow in this repo; the pushed tag *is* the
+release, nothing publishes it further.
+
+1. Bump `"version"` in `package.json` (semver; patch for bug fixes).
+2. Update every `#v<old-version>` reference in `README.md` to the new tag —
+   `grep -n '#v[0-9]' README.md` to find them all (there were 7 as of
+   v2.0.1; don't assume that count stays fixed).
+3. Commit, `git push origin main`.
+4. `git tag -a v<version> -m "make-runner-mcp <version>" && git push origin v<version>`.
