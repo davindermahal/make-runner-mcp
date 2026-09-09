@@ -75,7 +75,7 @@ The server is the same everywhere — only the config file and its shape
 differ per client. Things that change between projects/teams:
 
 - `PROJECT_DIR` — the target project's root.
-- `#v2.0.0` — bump this to whatever tag you've actually released. Always
+- `#v2.0.1` — bump this to whatever tag you've actually released. Always
   pin to a release tag, never `#main`: for a tool that executes commands,
   an unpinned branch reference means a bad push could silently change what
   runs on everyone's machine.
@@ -90,7 +90,7 @@ differ per client. Things that change between projects/teams:
   "mcpServers": {
     "makeRunner": {
       "command": "npx",
-      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.0"],
+      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.1"],
       "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
@@ -104,13 +104,13 @@ Project-level `.mcp.json` at the repo root (checked in, shared with the team):
   "mcpServers": {
     "makeRunner": {
       "command": "npx",
-      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.0"],
+      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.1"],
       "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
 }
 ```
-Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -e MCP_TRANSPORT=stdio -- npx -y github:davindermahal/make-runner-mcp#v2.0.0`
+Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -e MCP_TRANSPORT=stdio -- npx -y github:davindermahal/make-runner-mcp#v2.0.1`
 
 ### Claude Desktop
 `claude_desktop_config.json` (Settings → Developer → Edit Config):
@@ -119,7 +119,7 @@ Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -e MC
   "mcpServers": {
     "makeRunner": {
       "command": "npx",
-      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.0"],
+      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.1"],
       "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
@@ -133,7 +133,7 @@ Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -e MC
   "mcpServers": {
     "makeRunner": {
       "command": "npx",
-      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.0"],
+      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.1"],
       "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
@@ -165,7 +165,7 @@ on this machine):
 PROJECT_DIR=/path/to/project \
 MCP_HTTP_TOKEN=$(openssl rand -hex 24) \
 MCP_HTTP_PORT=8791 \
-npx -y github:davindermahal/make-runner-mcp#v2.0.0
+npx -y github:davindermahal/make-runner-mcp#v2.0.1
 ```
 
 Generate a real random token (`openssl rand -hex 24` or equivalent) and

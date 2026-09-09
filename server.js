@@ -92,6 +92,11 @@ const TIMEOUT_MS = 5 * 60 * 1000;
 const KILL_GRACE_MS = 5000;
 const MAX_OUTPUT_BYTES = 200_000;
 const MAX_INCLUDE_DEPTH = 8;
+// A session that never sends a proper close (crashed/killed client, buggy
+// client) would otherwise stay in `sessions` forever; swept on a timer
+// rather than trusting every client to close cleanly.
+const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const SESSION_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 // Makefile `## comment` text is surfaced verbatim as MCP tool descriptions
 // — untrusted-adjacent content read straight into the calling agent's
 // context on every listTools call, whether or not the target is ever
@@ -334,7 +339,7 @@ function isAllowed(name, config) {
   if (HARD_DENY_WORDS.some((d) => normalized.includes(d))) return false;
   if (HARD_DENY_PREFIXES.some((d) => lower.startsWith(d))) return false;
   if (config.deny.some((d) => lower.includes(d.toLowerCase()))) return false;
-  if (config.allow && !config.allow.includes(name)) return false;
+  if (config.allow && !config.allow.some((a) => a.toLowerCase() === lower)) return false;
   return true;
 }
 
@@ -419,23 +424,41 @@ function runMake(targetArgs, label, config) {
       }
     };
 
+    // Tracked separately from `timer` so a child that exits cleanly within
+    // the SIGTERM grace period cancels the pending SIGKILL too — otherwise
+    // it fires later against whatever process the OS has since reused
+    // `child.pid` for.
+    let killTimer = null;
+
     const timer = setTimeout(() => {
       timedOut = true;
       killTree("SIGTERM");
-      setTimeout(() => killTree("SIGKILL"), KILL_GRACE_MS);
+      killTimer = setTimeout(() => killTree("SIGKILL"), KILL_GRACE_MS);
     }, TIMEOUT_MS);
 
+    const appendCapped = (buf, chunk) => {
+      if (buf.length >= MAX_OUTPUT_BYTES) {
+        truncated = true;
+        return buf;
+      }
+      const s = chunk.toString();
+      if (buf.length + s.length > MAX_OUTPUT_BYTES) {
+        truncated = true;
+        return buf + s.slice(0, MAX_OUTPUT_BYTES - buf.length);
+      }
+      return buf + s;
+    };
+
     child.stdout.on("data", (c) => {
-      if (stdout.length < MAX_OUTPUT_BYTES) stdout += c.toString();
-      else truncated = true;
+      stdout = appendCapped(stdout, c);
     });
     child.stderr.on("data", (c) => {
-      if (stderr.length < MAX_OUTPUT_BYTES) stderr += c.toString();
-      else truncated = true;
+      stderr = appendCapped(stderr, c);
     });
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       resolve({
         content: [
           {
@@ -564,7 +587,23 @@ if (MCP_TRANSPORT === "http") {
   // Server/transport across sessions produces "Server already initialized"
   // on the second session's handshake, since a Server represents one
   // connected session, not a process-wide singleton.
-  const sessions = new Map();
+  const sessions = new Map(); // sessionId -> { transport, lastSeen }
+
+  const sweepIdleSessions = () => {
+    const cutoff = Date.now() - SESSION_IDLE_TIMEOUT_MS;
+    for (const [sid, entry] of sessions) {
+      if (entry.lastSeen < cutoff) {
+        sessions.delete(sid);
+        try {
+          entry.transport.close();
+        } catch (err) {
+          console.error(`Error closing idle session ${sid}: ${err.stack || err.message}`);
+        }
+      }
+    }
+  };
+  const sweepTimer = setInterval(sweepIdleSessions, SESSION_SWEEP_INTERVAL_MS);
+  sweepTimer.unref();
 
   const expectedAuth = `Bearer ${MCP_HTTP_TOKEN}`;
 
@@ -607,7 +646,9 @@ if (MCP_TRANSPORT === "http") {
 
     try {
       if (sessionId && sessions.has(sessionId)) {
-        await sessions.get(sessionId).handleRequest(req, res, req.method === "POST" ? await readJsonBody(req) : undefined);
+        const entry = sessions.get(sessionId);
+        entry.lastSeen = Date.now();
+        await entry.transport.handleRequest(req, res, req.method === "POST" ? await readJsonBody(req) : undefined);
         return;
       }
 
@@ -621,7 +662,7 @@ if (MCP_TRANSPORT === "http") {
         }
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (sid) => sessions.set(sid, transport),
+          onsessioninitialized: (sid) => sessions.set(sid, { transport, lastSeen: Date.now() }),
         });
         transport.onclose = () => {
           if (transport.sessionId) sessions.delete(transport.sessionId);
