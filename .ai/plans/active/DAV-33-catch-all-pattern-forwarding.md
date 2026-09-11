@@ -507,20 +507,23 @@ None.
 
 ## Confirm at Review
 
-- [ ] Only `-C <dir>` / `-C<dir>` (GNU make's short flag, space optional)
+- [x] Only `-C <dir>` / `-C<dir>` (GNU make's short flag, space optional)
       is detected as the forwarding flag — not `--directory=<dir>`. The
       ticket's own example uses `-C`, and it's by far the more common
       spelling in the wild. Recommendation: ship with `-C` only; if a real
       project needs `--directory=`, that's a fast, low-risk follow-up to
-      this same regex, not worth speculatively building now.
-- [ ] Forwarded targets get no special marker in their MCP tool
+      this same regex, not worth speculatively building now. Confirmed:
+      accepting the recommendation.
+- [x] Forwarded targets get no special marker in their MCP tool
       description (e.g. no "(forwarded from docker/Makefile)" suffix) —
       they're described using their own `##` comment exactly like an
       `include`d target is today. Recommendation: keep this consistent;
       adding a marker for one discovery mechanism (`%:` forwarding) but
       not the other (`include`) would be an arbitrary inconsistency.
-- [ ] The forwarding directory's makefile must be named exactly
+      Confirmed: accepting the recommendation.
+- [x] The forwarding directory's makefile must be named exactly
       `Makefile` (no `makefile`/`GNUmakefile` fallback), matching how this
       project's own root Makefile path is already hardcoded
       (server.js:74). Recommendation: keep this consistent rather than
       adding fallback resolution logic nothing else in this file has.
+      Confirmed: accepting the recommendation.
