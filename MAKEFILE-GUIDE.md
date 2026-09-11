@@ -64,6 +64,16 @@ words" rule breaks. For each hit, find which real target's recipe consumes
 it (read a few lines above/below the match) and add that target's name to
 a list: **targets to convert**.
 
+A `^%:` hit whose recipe contains `$(MAKE)` with a `-C` flag (forwarding
+any undefined goal to another directory's Makefile, e.g. `%:` →
+`@$(MAKE) -C docker $@`) is a *different*, already-supported idiom —
+make-runner-mcp discovers and exposes those forwarded targets
+automatically. Do not add it to **targets to convert**, and skip §4's
+"remove the dead catch-all rule" for it. Only a `%:` rule that swallows
+bare-word `$(MAKECMDGOALS)` arguments (typically paired with an `@:`
+no-op recipe, no `$(MAKE) -C ...` call) is the incompatible pattern this
+guide's §3–4 converts or removes.
+
 If none of the four commands return anything, skip to §6 — there's nothing
 to convert, only the checks in §5–§7 still apply.
 
