@@ -1,0 +1,13 @@
+{
+  "jiraProjectKeys": [
+    "DAV"
+  ],
+  "appTag": "app:make-runner-mcp",
+  "skipTargets": [
+    "install",
+    "build",
+    "test",
+    "lint",
+    "exec"
+  ]
+}
