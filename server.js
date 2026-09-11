@@ -4,7 +4,10 @@
  *
  * Parses the project's own Makefile (following any `include`/`-include`
  * directives, e.g. a root Makefile pulling in `docker/Makefile`) and
- * exposes one MCP tool per discovered target. Nothing is exposed or
+ * exposes one MCP tool per discovered target. Also follows a root catch-all
+ * pattern rule (`%:`) whose recipe recursively invokes `$(MAKE) -C <dir>
+ * ...`, so targets only reachable through that forwarding are discovered
+ * and exposed too. Nothing is exposed or
  * executed that isn't literally a target defined in those files — the
  * model can't construct or type an arbitrary command, only invoke targets
  * that already exist in files your team presumably reviews like any other
@@ -255,13 +258,22 @@ function loadConfig() {
 
 // Parses real targets out of a Makefile: lines like
 //   target: deps ## Optional self-documenting comment
-// Skips pattern rules (%), special targets (.PHONY etc.), and variable
-// assignments (which also contain a colon, e.g. FOO := bar). Follows
-// include/-include/sinclude directives (e.g. a root Makefile pulling in
-// docker/Makefile) so targets defined there are discovered too — the real
-// `make` invocation would load them anyway via the same directive, so
-// treating them as un-vetted would just leave real targets unexposed
-// while offering no actual protection.
+// Skips non-catch-all pattern rules (%.o: %.c, docker-%:, etc.), special
+// targets (.PHONY etc.), and variable assignments (which also contain a
+// colon, e.g. FOO := bar). Follows include/-include/sinclude directives
+// (e.g. a root Makefile pulling in docker/Makefile) so targets defined
+// there are discovered too — the real `make` invocation would load them
+// anyway via the same directive, so treating them as un-vetted would just
+// leave real targets unexposed while offering no actual protection.
+//
+// Also follows the catch-all forwarding idiom — a bare `%:` rule whose
+// recipe recursively invokes `$(MAKE) -C <dir> ...` to forward any goal
+// not defined at this level to another directory's Makefile. Real `make`
+// already resolves and runs such a forwarded goal correctly through this
+// server's existing `make -f <Makefile> <target>` invocation (an explicit
+// target always still wins over the pattern rule, same as real `make`);
+// the only gap this closes is discovery, so those targets can be listed
+// and invoked as MCP tools like any other.
 //
 // Every file is resolved to its real (symlink-dereferenced) path before
 // being read or boundary-checked, so a symlinked directory pointing
@@ -284,7 +296,15 @@ function parseTargetsInto(filePath, targets, visited, depth) {
   const text = readFileSync(real, "utf8");
   const lines = text.split("\n");
 
-  for (const line of lines) {
+  // Directories to forward into, collected here but not resolved until
+  // after this file's own loop finishes (see the loop below this one) —
+  // so an explicit target declared anywhere in this file always wins over
+  // a same-named forwarded target, matching real `make`'s own precedence
+  // regardless of whether the `%:` rule appears before or after it.
+  const forwardDirs = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const inc = line.match(/^\s*(?:-|s)?include\s+(.+)$/);
     if (inc) {
       for (const part of inc[1].trim().split(/\s+/)) {
@@ -311,11 +331,34 @@ function parseTargetsInto(filePath, targets, visited, depth) {
     const hashMatch = line.match(/(?<!\\)#/);
     const rulePart = hashMatch ? line.slice(0, hashMatch.index) : line;
 
+    // The catch-all forwarding idiom: a rule whose target is *only* `%`
+    // (matches every goal), as opposed to a suffix/prefix pattern rule
+    // like `%.o: %.c` or `docker-%:`, which this regex does not match and
+    // which falls through to the general target regex below (and is
+    // skipped there, as always, since `%` isn't in its character class).
+    const catchAll = rulePart.match(/^%\s*:(?!=)(?:[^=]*)$/);
+    if (catchAll) {
+      // Scan only this rule's own recipe lines — consecutive lines
+      // immediately following it that start with a tab, make's own
+      // recipe-line convention — stopping at the first line that isn't
+      // one. The lazy `[^\n]*?` lets other flags (e.g.
+      // `--no-print-directory`) appear before `-C` on the same line.
+      let j = i + 1;
+      let forwardDir = null;
+      while (j < lines.length && /^\t/.test(lines[j])) {
+        const mk = lines[j].match(/\$\(MAKE\)[^\n]*?-C\s*"?([^\s"]+)"?/);
+        if (mk && !forwardDir) forwardDir = mk[1];
+        j++;
+      }
+      i = j - 1; // resume the outer loop after this rule's recipe lines
+      if (forwardDir && !forwardDir.includes("$")) forwardDirs.push(forwardDir); // else: not a forward, or unresolvable variable expansion
+      continue;
+    }
+
     const m = rulePart.match(/^([A-Za-z0-9][A-Za-z0-9_.-]*)\s*:(?!=)(?:[^=]*)$/);
     if (!m) continue;
     const name = m[1];
     if (name.startsWith(".")) continue; // .PHONY, .DEFAULT, etc.
-    if (name.includes("%")) continue; // pattern rules
     if (targets.has(name)) continue; // first definition wins, like make itself
 
     const commentMatch = line.match(/##\s*(.+)$/);
@@ -324,6 +367,10 @@ function parseTargetsInto(filePath, targets, visited, depth) {
       description = description.slice(0, MAX_DESCRIPTION_LENGTH) + "…";
     }
     targets.set(name, description);
+  }
+
+  for (const dir of forwardDirs) {
+    parseTargetsInto(path.resolve(fileDir, dir, "Makefile"), targets, visited, depth + 1);
   }
 }
 
