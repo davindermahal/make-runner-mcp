@@ -1,6 +1,6 @@
 # Plan: DAV-33 make-runner-mcp needs to handle catch-all pattern forwarding
 
-**Status**: active
+**Status**: completed
 **Branch**: feature/DAV-33-make-runner-mcp-needs-to-handle-catch-all-pattern-
 **Created**: 2026-09-10
 **Updated**: 2026-09-11
