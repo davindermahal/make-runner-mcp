@@ -100,6 +100,23 @@ const FIX_MAKEFILE_LINKS_SKILL_PATH = path.join(
   "SKILL.md"
 );
 
+// Read once at startup, not hardcoded — the MCP `initialize` response's
+// serverInfo.version previously drifted from package.json's own version
+// for two releases (stuck at "2.0.0" through v2.0.1 and v2.0.2) because
+// nothing tied them together. Falls back to "0.0.0-unknown" rather than
+// crashing the server over a cosmetic field if package.json is ever
+// missing/unreadable next to this script.
+function readOwnVersion() {
+  try {
+    const pkgPath = path.join(path.dirname(SCRIPT_PATH), "package.json");
+    return JSON.parse(readFileSync(pkgPath, "utf8")).version;
+  } catch (err) {
+    console.error(`Failed to read own version from package.json: ${err.message}`);
+    return "0.0.0-unknown";
+  }
+}
+const SERVER_VERSION = readOwnVersion();
+
 // HTTP is the default transport (stdio is the opt-in) specifically so this
 // server runs *outside* a sandboxed agent's own container/filesystem, with
 // the agent reaching it only over the network, never via a locally-spawned
@@ -767,7 +784,7 @@ function runMake(targetArgs, label, config, cwd = PROJECT_DIR) {
 // cost to this beyond the one-time setup below.
 function createServer() {
   const server = new Server(
-    { name: "make-runner", version: "2.0.0" },
+    { name: "make-runner", version: SERVER_VERSION },
     { capabilities: { tools: {}, prompts: {} } }
   );
 

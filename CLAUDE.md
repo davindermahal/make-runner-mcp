@@ -72,9 +72,18 @@ Not published to npm — distributed only via a GitHub release tag
 plan above. There's no CI workflow in this repo; the pushed tag *is* the
 release, nothing publishes it further.
 
-1. Bump `"version"` in `package.json` (semver; patch for bug fixes).
+1. `npm version <patch|minor|major> --no-git-tag-version` — bumps
+   `"version"` in both `package.json` *and* `package-lock.json` together.
+   Don't hand-edit `"version"` in `package.json` alone: `package-lock.json`
+   silently fell out of sync doing exactly that for the v2.1.0 release
+   (both its `version` fields stayed at `2.0.2`) — this command is what
+   keeps them together. `server.js`'s own MCP `serverInfo.version` reads
+   `package.json` at startup (see `readOwnVersion()`), so it doesn't need
+   a separate step — it also drifted for two releases (stuck at `2.0.0`
+   through v2.0.1/v2.0.2) before that was added.
 2. Update every `#v<old-version>` reference in `README.md` to the new tag —
    `grep -n '#v[0-9]' README.md` to find them all (there were 7 as of
    v2.0.1; don't assume that count stays fixed).
-3. Commit, `git push origin main`.
+3. Commit (`package.json`, `package-lock.json`, `README.md`),
+   `git push origin main`.
 4. `git tag -a v<version> -m "make-runner-mcp <version>" && git push origin v<version>`.
