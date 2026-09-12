@@ -1,0 +1,59 @@
+name: Release
+
+# Triggered by pushing an annotated tag matching v<semver> (e.g. v2.1.0), created by hand after a
+# deliberate version-bump commit -- see CLAUDE.md's "Releasing" section. This workflow does not
+# decide *when* or *how much* to bump version -- that's still a human call. It only automates the
+# previously-manual, error-prone mechanics: test, then publish.
+#
+# One-time prerequisite before this can succeed: this package must already exist on the npm
+# registry (trusted publishing can only be configured for a package that's already there -- see
+# CLAUDE.md), and a Trusted Publisher naming this exact repo + this exact workflow filename
+# (release.yml) must be configured on the package's npmjs.com settings page.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for OIDC trusted publishing (npm >=11.5.1) -- no NPM_TOKEN
+                       # secret needed; auth + provenance both happen automatically via the OIDC
+                       # token this permission lets the job request. Requires the one-time Trusted
+                       # Publisher setup described above.
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail loud before spending any CI time on install/test if the tag doesn't match what's
+      # actually committed at this ref -- catches "tagged the wrong commit" or "forgot to push the
+      # version-bump commit first" immediately instead of publishing the wrong version.
+      - name: Verify tag matches package.json version
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (version $TAG_VERSION) does not match package.json version $PKG_VERSION at this commit"
+            exit 1
+          fi
+          echo "Tag $GITHUB_REF_NAME matches package.json version $PKG_VERSION"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >=11.5.1; don't trust the runner image's bundled version to
+      # already satisfy that (it's whatever ships with actions/setup-node's Node 24 build at
+      # whatever point this runs) -- upgrade explicitly so OIDC auth is guaranteed to engage
+      # instead of silently falling through to a token-based path that has no token to find.
+      - run: npm install -g npm@latest
+      - run: npm --version
+
+      - run: npm ci
+      - run: npm test
+
+      - name: Publish to npm
+        run: npm publish

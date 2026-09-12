@@ -7,8 +7,22 @@
   "bin": {
     "make-runner-mcp": "./server.js"
   },
+  "files": [
+    "server.js",
+    "skills",
+    "MAKEFILE-GUIDE.md"
+  ],
   "scripts": {
     "test": "node --test"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/davindermahal/make-runner-mcp.git"
+  },
+  "homepage": "https://github.com/davindermahal/make-runner-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/davindermahal/make-runner-mcp/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0"

@@ -52,25 +52,42 @@ free-form command path into this server at all.
 
 ## Distribution plan
 
-Ship via GitHub, not npm, to start — lowest friction for the team:
+Originally GitHub-tag-only (lowest friction to start — a public repo means
+`npx github:...` works with zero auth setup on any machine, and pinning to
+a tag rather than `main` means a bad push can never silently change what
+runs on everyone's machine). That reasoning still holds and this path
+still works unauthenticated for anyone:
+`npx -y github:<owner>/<repo>#v<tag>`.
 
-- Public repo (no sensitive data in this code) so `npx github:...` works
-  with zero auth setup on any teammate's machine.
-- Tag releases (`v1.0.0`, `v1.1.0`, ...) rather than pointing configs at
-  `main`. For a tool that executes commands, an unpinned branch reference
-  means a bad push could silently change what runs on everyone's machine —
-  pinning makes updates a deliberate, visible choice.
-- Team config snippet points at a specific tag:
-  `npx -y github:<owner>/<repo>#v1.0.0`.
-- npm publishing is a possible later step (marginally faster resolution,
-  no GitHub dependency) but isn't required to ship this.
+Now **also** published to npm (`make-runner-mcp`), added specifically so
+`gemini-sandbox-toolkit`'s `make upgrade-mcps` can check this package's
+version the same way it already checks its other npm-published MCP
+servers (a plain `npm view <package> version`), instead of needing its own
+separate `git ls-remote --tags`-based lookup. See `.github/workflows/
+release.yml` and "Releasing" below for how a tag push turns into an npm
+publish, and that section's "one-time bootstrap" note if trusted
+publishing hasn't been configured on npmjs.com yet.
 
 ## Releasing
 
-Not published to npm — distributed only via a GitHub release tag
-(`npx github:davindermahal/make-runner-mcp#v<tag>`), per the distribution
-plan above. There's no CI workflow in this repo; the pushed tag *is* the
-release, nothing publishes it further.
+Dual distribution: the GitHub tag path above (still fully supported, no
+setup needed) and npm, the latter auto-published by
+`.github/workflows/release.yml` via OIDC trusted publishing when a
+`v<semver>` tag is pushed — no `NPM_TOKEN` secret, no local `npm publish`.
+A local `npm publish` bypasses that gate — don't use it once trusted
+publishing is set up (the one exception is the bootstrap step below).
+
+**One-time bootstrap, not yet done as of this writing:** npm's trusted
+publishing can only be configured for a package that already exists on
+the registry — there's no way to pre-register a trusted publisher for a
+name that's never been published. So the very first publish has to be a
+manual, logged-in `npm publish` from someone's machine, at whatever
+`package.json` version is current at the time. Only after that one manual
+publish can a Trusted Publisher be added on the package's npmjs.com
+settings page, naming this exact repo (`davindermahal/make-runner-mcp`)
+and this exact workflow filename (`release.yml`) — until that's done, a
+pushed tag will run `release.yml`, but its `npm publish` step will fail
+with an auth error, not silently no-op.
 
 1. `npm version <patch|minor|major> --no-git-tag-version` — bumps
    `"version"` in both `package.json` *and* `package-lock.json` together.
@@ -84,6 +101,11 @@ release, nothing publishes it further.
 2. Update every `#v<old-version>` reference in `README.md` to the new tag —
    `grep -n '#v[0-9]' README.md` to find them all (there were 7 as of
    v2.0.1; don't assume that count stays fixed).
-3. Commit (`package.json`, `package-lock.json`, `README.md`),
+3. `npm test` — CI (`.github/workflows/ci.yml`) runs this on every push/PR
+   to `main` too; confirm locally first.
+4. Commit (`package.json`, `package-lock.json`, `README.md`),
    `git push origin main`.
-4. `git tag -a v<version> -m "make-runner-mcp <version>" && git push origin v<version>`.
+5. `git tag -a v<version> -m "make-runner-mcp <version>" && git push origin v<version>`
+   — this is what triggers `release.yml` to publish to npm (once the
+   bootstrap above is done).
+6. Watch the release run: `gh run list` / `gh run watch <run-id>`.
