@@ -25,6 +25,18 @@ free-form command path into this server at all.
 
 - `server.js` parses the target project's `Makefile` (pointed at via the
   `PROJECT_DIR` env var) and exposes one MCP tool per discovered target.
+  A second Makefile's targets can be pulled in via a real `include`
+  directive, the `%:` catch-all forwarding idiom, or (when neither of
+  those actually applies) a `## make-runner: also-read <path>` comment
+  marker read by this server only — see README's "Multiple Makefiles"
+  section. `node server.js --diagnose` reports what got discovered vs.
+  silently skipped, for diagnosing exactly this kind of gap.
+- The server also advertises an MCP **prompt** (`fix-makefile-links`,
+  alongside the `tools` capability) that serves
+  `skills/fix-makefile-links/SKILL.md` — the same fix-it-automatically
+  procedure, also distributable standalone as a Claude Code skill for
+  people not using this server as an MCP server. One file, two delivery
+  paths; see `buildFixMakefileLinksPrompt()` in `server.js`.
 - Self-documenting comments (`target: ## description`) become the tool's
   description, so the agent sees accurate, per-project docs automatically.
 - A hard-coded denylist (`deploy`, `destroy`, `prod`, `publish`, `release`,

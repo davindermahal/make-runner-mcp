@@ -1,6 +1,6 @@
 {
   "name": "make-runner-mcp",
-  "version": "2.0.2",
+  "version": "2.1.0",
   "type": "module",
   "description": "Scoped MCP server exposing only make up / make test / make composer for a project.",
   "main": "server.js",

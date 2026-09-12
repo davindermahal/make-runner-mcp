@@ -7,7 +7,13 @@
  * exposes one MCP tool per discovered target. Also follows a root catch-all
  * pattern rule (`%:`) whose recipe recursively invokes `$(MAKE) -C <dir>
  * ...`, so targets only reachable through that forwarding are discovered
- * and exposed too. Nothing is exposed or
+ * and exposed too. For a second Makefile that isn't reachable through
+ * either of those real make mechanisms (e.g. its include path uses a
+ * `$(VAR)` this server can't resolve, or it's a wholly separate,
+ * independently-invoked Makefile), a `# make-runner: also-read <path>`
+ * comment anywhere in a parsed file tells this server (not `make`) to also
+ * read that file's targets — those are then run directly against that
+ * file (see MAKEFILE-GUIDE.md). Nothing is exposed or
  * executed that isn't literally a target defined in those files — the
  * model can't construct or type an arbitrary command, only invoke targets
  * that already exist in files your team presumably reviews like any other
@@ -65,18 +71,34 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const PROJECT_DIR = path.resolve(process.env.PROJECT_DIR || process.cwd());
 const MAKEFILE = path.join(PROJECT_DIR, "Makefile");
 const CONFIG_PATH =
   process.env.MCP_MAKE_CONFIG || path.join(PROJECT_DIR, ".mcp-make-config.json");
+
+// This server's own location, not the target project's — used to serve the
+// "fix-makefile-links" MCP prompt (below) straight from the same checkout
+// this server is running from, and to point that prompt's own verification
+// step back at this exact server.js rather than asking whoever receives
+// the prompt to go find one.
+const SCRIPT_PATH = fileURLToPath(import.meta.url);
+const FIX_MAKEFILE_LINKS_SKILL_PATH = path.join(
+  path.dirname(SCRIPT_PATH),
+  "skills",
+  "fix-makefile-links",
+  "SKILL.md"
+);
 
 // HTTP is the default transport (stdio is the opt-in) specifically so this
 // server runs *outside* a sandboxed agent's own container/filesystem, with
@@ -175,6 +197,27 @@ if (!existsSync(MAKEFILE)) {
   process.exit(1);
 }
 
+// Resolved once so include-boundary checks compare real paths, not lexical
+// ones — a symlinked subdirectory (e.g. `docker_files` pointing outside the
+// project) would otherwise pass a plain path.resolve()-based prefix check
+// while actually reading from outside PROJECT_DIR.
+const PROJECT_DIR_REAL = realpathSync(PROJECT_DIR);
+
+// `--diagnose` runs the same Makefile-parsing this server uses for real,
+// then prints a human-readable report of what it found (and, more
+// usefully, what it *couldn't* resolve) and exits — no MCP transport, no
+// MCP_HTTP_TOKEN required. This is meant to be run directly by a person
+// against their own project (`PROJECT_DIR=/path/to/project node
+// /path/to/make-runner-mcp/server.js --diagnose`) to check whether their
+// Makefile(s) will be read the way they expect *before* wiring the server
+// into an agent, rather than discovering a gap only once an agent reports
+// a target as missing. See MAKEFILE-GUIDE.md for how to act on each
+// section of the report.
+if (process.argv.includes("--diagnose")) {
+  runDiagnostics();
+  process.exit(0);
+}
+
 if (MCP_TRANSPORT === "http" && !MCP_HTTP_TOKEN) {
   // Fail closed, loudly, at startup — not on the first request. A network
   // listener that executes commands with no auth at all is the one mistake
@@ -186,12 +229,6 @@ if (MCP_TRANSPORT === "http" && !MCP_HTTP_TOKEN) {
   console.error(`Unknown MCP_TRANSPORT '${MCP_TRANSPORT}'. Use 'stdio' (default) or 'http'.`);
   process.exit(1);
 }
-
-// Resolved once so include-boundary checks compare real paths, not lexical
-// ones — a symlinked subdirectory (e.g. `docker_files` pointing outside the
-// project) would otherwise pass a plain path.resolve()-based prefix check
-// while actually reading from outside PROJECT_DIR.
-const PROJECT_DIR_REAL = realpathSync(PROJECT_DIR);
 
 // Rejects anything that isn't a safe flag or a safe VAR=value assignment.
 // Returns an error string, or null if OK.
@@ -275,20 +312,51 @@ function loadConfig() {
 // the only gap this closes is discovery, so those targets can be listed
 // and invoked as MCP tools like any other.
 //
+// Both of the above are *real* make mechanisms: whatever file this server
+// ultimately invokes with `-f <execCtx.file>` will itself load the same
+// included/forwarded file the same way, so the target really does exist
+// from that invocation's point of view. `execCtx` tracks which file/cwd a
+// discovered target should actually be run through — it stays the parent
+// call's file/dir for both of these, since that's what real `make` would
+// use too.
+//
+// A third, non-make mechanism exists for projects where a second Makefile
+// genuinely isn't reachable via include/forwarding (e.g. the include path
+// can't be resolved because it uses a `$(VAR)`, or the second file is a
+// wholly separate, independently-invoked Makefile with no real linkage at
+// all): a `# make-runner: also-read <path>` (or `##`) comment anywhere in
+// the file. This is a hint *to this server*, not to `make` — nothing about
+// it changes what `make` itself would do with this file — so a target
+// found this way is executed directly against that other file (`-f
+// <linked file>`, cwd = its directory), not through execCtx.file. That
+// means it won't see variables the root Makefile might otherwise have set
+// for it; see MAKEFILE-GUIDE.md for when to reach for this vs. a real
+// include/forwarding link.
+//
 // Every file is resolved to its real (symlink-dereferenced) path before
 // being read or boundary-checked, so a symlinked directory pointing
 // outside PROJECT_DIR can't be used to smuggle targets from outside the
 // project past the "stay inside the project" check below.
-function parseTargetsInto(filePath, targets, visited, depth) {
+// `diag`, when passed (only by runDiagnostics()), is a sink for problems
+// that are otherwise silently skipped during normal parsing — an
+// unresolvable path is exactly as "not a target" to a real MCP tool call
+// either way, but a human running `--diagnose` benefits from being told
+// *why* a file it expected to see wasn't read, rather than just seeing it
+// missing from the output.
+function parseTargetsInto(filePath, targets, visited, depth, execCtx, diag = null) {
   if (depth > MAX_INCLUDE_DEPTH) return;
 
   let real;
   try {
     real = realpathSync(filePath);
   } catch {
+    if (diag) diag.missing.push(filePath);
     return; // doesn't exist, or a broken symlink
   }
-  if (real !== PROJECT_DIR_REAL && !real.startsWith(PROJECT_DIR_REAL + path.sep)) return;
+  if (real !== PROJECT_DIR_REAL && !real.startsWith(PROJECT_DIR_REAL + path.sep)) {
+    if (diag) diag.outsideProject.push(real);
+    return;
+  }
   if (visited.has(real)) return;
   visited.add(real);
 
@@ -303,14 +371,49 @@ function parseTargetsInto(filePath, targets, visited, depth) {
   // regardless of whether the `%:` rule appears before or after it.
   const forwardDirs = [];
 
+  // Files named via the `also-read` comment marker, resolved after this
+  // file's own loop finishes for the same reason as forwardDirs above: an
+  // explicit target defined anywhere in this file wins over one pulled in
+  // from a linked file.
+  const linkedFiles = [];
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const inc = line.match(/^\s*(?:-|s)?include\s+(.+)$/);
     if (inc) {
       for (const part of inc[1].trim().split(/\s+/)) {
-        if (!part || part.includes("$")) continue; // can't resolve variable expansions
+        if (!part) continue;
+        if (part.includes("$")) {
+          if (diag) diag.unresolvedIncludes.push({ inFile: real, raw: part });
+          continue; // can't resolve variable expansions
+        }
         const incPath = path.resolve(fileDir, part);
-        parseTargetsInto(incPath, targets, visited, depth + 1);
+        parseTargetsInto(incPath, targets, visited, depth + 1, execCtx, diag);
+      }
+      continue;
+    }
+
+    // The `also-read` marker: a plain comment, recognized by this server
+    // only — it has no effect on what real `make` does with this file.
+    // One or more whitespace-separated paths, each resolved relative to
+    // this file's own directory (matching how `include` resolves paths).
+    const alsoRead = line.match(/^\s*#{1,2}\s*make-runner:\s*also-read\s+(.+)$/);
+    if (alsoRead) {
+      for (const part of alsoRead[1].trim().split(/\s+/)) {
+        if (!part) continue;
+        if (part.includes("$")) {
+          if (diag) diag.unresolvedAlsoReads.push({ inFile: real, raw: part });
+          continue; // can't resolve variable expansions
+        }
+        let linkedPath = path.resolve(fileDir, part);
+        try {
+          if (statSync(linkedPath).isDirectory()) linkedPath = path.join(linkedPath, "Makefile");
+        } catch {
+          // doesn't exist at this exact path — fall through and let the
+          // recursive parseTargetsInto's own realpathSync try/catch report
+          // it as unreadable, same as any other missing include target.
+        }
+        linkedFiles.push(linkedPath);
       }
       continue;
     }
@@ -366,17 +469,32 @@ function parseTargetsInto(filePath, targets, visited, depth) {
     if (description.length > MAX_DESCRIPTION_LENGTH) {
       description = description.slice(0, MAX_DESCRIPTION_LENGTH) + "…";
     }
-    targets.set(name, description);
+    targets.set(name, { description, execFile: execCtx.file, execDir: execCtx.dir });
   }
 
   for (const dir of forwardDirs) {
-    parseTargetsInto(path.resolve(fileDir, dir, "Makefile"), targets, visited, depth + 1);
+    parseTargetsInto(path.resolve(fileDir, dir, "Makefile"), targets, visited, depth + 1, execCtx, diag);
+  }
+
+  // Unlike forwardDirs above, each linked file gets its *own* execCtx: it's
+  // executed directly (`-f <linked file>`, cwd = its directory), not via
+  // execCtx.file, since — being a server-only hint rather than a real make
+  // mechanism — real `make -f execCtx.file` would never actually load it.
+  for (const linkedPath of linkedFiles) {
+    parseTargetsInto(
+      linkedPath,
+      targets,
+      visited,
+      depth + 1,
+      { file: linkedPath, dir: path.dirname(linkedPath) },
+      diag
+    );
   }
 }
 
-function parseTargets() {
-  const targets = new Map(); // name -> description
-  parseTargetsInto(MAKEFILE, targets, new Set(), 0);
+function parseTargets(diag = null) {
+  const targets = new Map(); // name -> { description, execFile, execDir }
+  parseTargetsInto(MAKEFILE, targets, new Set(), 0, { file: MAKEFILE, dir: PROJECT_DIR }, diag);
   return targets;
 }
 
@@ -404,7 +522,7 @@ function toolNameFor(target) {
 function buildToolEntries(targets, config) {
   const entries = [];
   const usedToolNames = new Set();
-  for (const [name, description] of targets) {
+  for (const [name, meta] of targets) {
     if (!isAllowed(name, config)) continue;
     const toolName = toolNameFor(name);
     if (usedToolNames.has(toolName)) {
@@ -414,9 +532,115 @@ function buildToolEntries(targets, config) {
       continue;
     }
     usedToolNames.add(toolName);
-    entries.push({ targetName: name, toolName, description });
+    entries.push({ targetName: name, toolName, description: meta.description, execFile: meta.execFile, execDir: meta.execDir });
   }
   return entries;
+}
+
+// Human-facing report for `--diagnose` (see the flag's own comment above
+// for why/when to run it). Automates the parts of MAKEFILE-GUIDE.md that
+// this server can actually check for itself — what got discovered, what
+// got silently skipped and why, which targets the denylist blocks — so a
+// person can see the gap directly instead of having to hand this file to
+// an agent and ask it to work through the guide by hand.
+function runDiagnostics() {
+  const config = loadConfig();
+  const diag = { missing: [], outsideProject: [], unresolvedIncludes: [], unresolvedAlsoReads: [] };
+  const targets = parseTargets(diag);
+  const entries = buildToolEntries(targets, config);
+  const exposedNames = new Set(entries.map((e) => e.targetName));
+
+  const lines = [];
+  const section = (title) => lines.push("", `-- ${title} --`);
+
+  section(`EXPOSED TARGETS (${entries.length})`);
+  if (entries.length === 0) lines.push("none");
+  for (const e of entries) {
+    const via = e.execFile !== MAKEFILE ? ` [via ${path.relative(PROJECT_DIR, e.execFile)}]` : "";
+    const desc = e.description === `Run 'make ${e.targetName}'` ? "MISSING DESCRIPTION — add a `## ...` comment" : e.description;
+    lines.push(`${e.targetName}${via}: ${desc}`);
+  }
+
+  section("BLOCKED TARGETS (denied by hard denylist or config)");
+  const blocked = [...targets.keys()].filter((n) => !exposedNames.has(n));
+  if (blocked.length === 0) lines.push("none");
+  for (const name of blocked) {
+    const lower = name.toLowerCase();
+    const normalized = lower.replace(/[-_.]/g, "");
+    const hardHit = HARD_DENY_WORDS.find((d) => normalized.includes(d));
+    const prefixHit = HARD_DENY_PREFIXES.find((d) => lower.startsWith(d));
+    const configDenyHit = config.deny.find((d) => lower.includes(d.toLowerCase()));
+    let reason;
+    if (hardHit) reason = `hard denylist word '${hardHit}' — CHECK: false positive? see MAKEFILE-GUIDE.md §5`;
+    else if (prefixHit) reason = `hard denylist prefix '${prefixHit}' — CHECK: false positive? see MAKEFILE-GUIDE.md §5`;
+    else if (configDenyHit) reason = `.mcp-make-config.json deny entry '${configDenyHit}'`;
+    else if (config.allow) reason = "not in .mcp-make-config.json's allow list";
+    else reason = "blocked (reason unclear — re-check config)";
+    lines.push(`${name}: ${reason}`);
+  }
+
+  section("UNRESOLVED $(VAR) INCLUDE PATHS (can't be resolved by this server or real `make -f` parsing alone)");
+  if (diag.unresolvedIncludes.length === 0) lines.push("none");
+  for (const u of diag.unresolvedIncludes) {
+    lines.push(`${path.relative(PROJECT_DIR, u.inFile)}: include ${u.raw} — flag as NEEDS HUMAN DECISION per MAKEFILE-GUIDE.md §1`);
+  }
+
+  section("UNRESOLVED $(VAR) also-read PATHS");
+  if (diag.unresolvedAlsoReads.length === 0) lines.push("none");
+  for (const u of diag.unresolvedAlsoReads) {
+    lines.push(`${path.relative(PROJECT_DIR, u.inFile)}: also-read ${u.raw} — the also-read marker can't resolve variables either; use a literal relative path`);
+  }
+
+  section("FILES REFERENCED BUT NOT FOUND (missing include/also-read target, or broken symlink)");
+  if (diag.missing.length === 0) lines.push("none");
+  for (const m of diag.missing) lines.push(m);
+
+  section("FILES REJECTED FOR RESOLVING OUTSIDE THE PROJECT (symlink or `../` escape)");
+  if (diag.outsideProject.length === 0) lines.push("none");
+  for (const o of diag.outsideProject) lines.push(o);
+
+  console.log(`make-runner-mcp diagnostics for PROJECT_DIR=${PROJECT_DIR}`);
+  console.log(`Root Makefile: ${MAKEFILE}`);
+  console.log(lines.join("\n"));
+}
+
+// Serves skills/fix-makefile-links/SKILL.md (the same file distributed for
+// manual/Claude-Code-skill installs — see README) as an MCP prompt, so
+// simply connecting to this server is enough to get it: no separate file
+// to copy into ~/.claude/skills first. One file stays the source of truth
+// for the procedure; this just strips the Claude-Code-specific frontmatter
+// and prepends the facts this running server already knows (its own
+// PROJECT_DIR/Makefile/script path) so whoever receives the prompt doesn't
+// need to search for a make-runner-mcp checkout the way a cold read of the
+// skill file on its own would require.
+function buildFixMakefileLinksPrompt() {
+  let raw;
+  try {
+    raw = readFileSync(FIX_MAKEFILE_LINKS_SKILL_PATH, "utf8");
+  } catch (err) {
+    console.error(`Failed to read ${FIX_MAKEFILE_LINKS_SKILL_PATH}: ${err.message}`);
+    return (
+      `Could not load the fix-makefile-links procedure from this server's own ` +
+      `checkout (expected at ${FIX_MAKEFILE_LINKS_SKILL_PATH}). Run ` +
+      `\`PROJECT_DIR=${PROJECT_DIR} node ${SCRIPT_PATH} --diagnose\` and fix any ` +
+      `gaps it reports using MAKEFILE-GUIDE.md's guidance on include/forwarding/` +
+      `also-read links.`
+    );
+  }
+  // Strip the leading YAML frontmatter block — it's Claude Code skill
+  // metadata (description/argument-hint/allowed-tools), meaningless to a
+  // raw MCP prompt message.
+  const body = raw.replace(/^---\n[\s\S]*?\n---\n/, "");
+  const context =
+    `You are receiving this as an MCP prompt served directly by the ` +
+    `make-runner-mcp server already configured for this project — you ` +
+    `already have everything Step 5 asks you to go find:\n\n` +
+    `Project root (PROJECT_DIR): ${PROJECT_DIR}\n` +
+    `Root Makefile: ${MAKEFILE}\n` +
+    `This server's own script, for Step 5's live verification: ${SCRIPT_PATH}\n` +
+    `  e.g. PROJECT_DIR="${PROJECT_DIR}" node "${SCRIPT_PATH}" --diagnose\n\n` +
+    `---\n\n`;
+  return context + body;
 }
 
 // By default the child inherits the full parent environment, which in an
@@ -444,14 +668,14 @@ function buildChildEnv(config) {
   return env;
 }
 
-function runMake(targetArgs, label, config) {
+function runMake(targetArgs, label, config, cwd = PROJECT_DIR) {
   return new Promise((resolve) => {
     // detached:true makes `child` a process-group leader (POSIX) so a
     // timeout can terminate the whole tree, not just the immediate `make`
     // process — otherwise a recipe that backgrounds work (e.g. `foo &`)
     // can outlive both the timeout and the tool call that started it.
     const child = spawn("make", targetArgs, {
-      cwd: PROJECT_DIR,
+      cwd,
       shell: false,
       detached: process.platform !== "win32",
       env: buildChildEnv(config),
@@ -544,7 +768,7 @@ function runMake(targetArgs, label, config) {
 function createServer() {
   const server = new Server(
     { name: "make-runner", version: "2.0.0" },
-    { capabilities: { tools: {} } }
+    { capabilities: { tools: {}, prompts: {} } }
   );
 
   // Both handlers below are wrapped in try/catch as a last line of defense:
@@ -559,21 +783,28 @@ function createServer() {
     try {
       const config = loadConfig();
       const targets = parseTargets();
-      const tools = buildToolEntries(targets, config).map(({ targetName, toolName, description }) => ({
-        name: toolName,
-        description: `${description} (make target: ${targetName})`,
-        inputSchema: {
-          type: "object",
-          properties: {
-            args: {
-              type: "array",
-              items: { type: "string" },
-              description: "Optional extra make flags and/or VAR=value pairs (e.g. ARGS=\"install symfony/console --no-dev\" for a target whose recipe uses $(ARGS)). No bare positional arguments — those would be treated as additional build goals.",
+      const tools = buildToolEntries(targets, config).map(({ targetName, toolName, description, execFile }) => {
+        // Flag targets reached only via the `also-read` marker (not a real
+        // make include/forwarding) so a calling agent understands this
+        // target runs against a separate Makefile, with its own directory
+        // as cwd — it won't see variables the root Makefile might set.
+        const viaNote = execFile !== MAKEFILE ? `, via ${path.relative(PROJECT_DIR, execFile)}` : "";
+        return {
+          name: toolName,
+          description: `${description} (make target: ${targetName}${viaNote})`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              args: {
+                type: "array",
+                items: { type: "string" },
+                description: "Optional extra make flags and/or VAR=value pairs (e.g. ARGS=\"install symfony/console --no-dev\" for a target whose recipe uses $(ARGS)). No bare positional arguments — those would be treated as additional build goals.",
+              },
             },
+            additionalProperties: false,
           },
-          additionalProperties: false,
-        },
-      }));
+        };
+      });
       return { tools };
     } catch (err) {
       console.error(`ListTools failed: ${err.stack || err.message}`);
@@ -611,8 +842,18 @@ function createServer() {
       }
 
       // -f pins make to exactly the file we parsed and vetted `match` against
-      // — no argument path (allowlisted or not) can override this.
-      return await runMake(["-f", MAKEFILE, match.targetName, ...extra], `target: ${match.targetName}`, config);
+      // — no argument path (allowlisted or not) can override this. For most
+      // targets that's the root MAKEFILE (real make will load whatever it
+      // includes/forwards to); for a target reached only via the
+      // `also-read` marker, match.execFile is that other file directly, run
+      // from its own directory (match.execDir), matching how it'd actually
+      // be invoked by hand.
+      return await runMake(
+        ["-f", match.execFile, match.targetName, ...extra],
+        `target: ${match.targetName}`,
+        config,
+        match.execDir
+      );
     } catch (err) {
       console.error(`CallTool failed: ${err.stack || err.message}`);
       return {
@@ -620,6 +861,38 @@ function createServer() {
         isError: true,
       };
     }
+  });
+
+  // A single prompt, "fix-makefile-links": see buildFixMakefileLinksPrompt()
+  // above for what it actually serves and why. This is what makes it
+  // reachable to any MCP client without a separate skill-file install —
+  // connecting to this server is enough.
+  server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+    prompts: [
+      {
+        name: "fix-makefile-links",
+        description:
+          "Find every Makefile in this project, check which ones make-runner-mcp can " +
+          "actually discover, and add the missing `also-read` link automatically for " +
+          "any that are orphaned — instead of just reporting the gap.",
+      },
+    ],
+  }));
+
+  server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+    const { name } = request.params;
+    if (name !== "fix-makefile-links") {
+      throw new Error(`Unknown prompt: ${name}`);
+    }
+    return {
+      description: "Diagnose and fix why make-runner-mcp isn't discovering a secondary Makefile's targets.",
+      messages: [
+        {
+          role: "user",
+          content: { type: "text", text: buildFixMakefileLinksPrompt() },
+        },
+      ],
+    };
   });
 
   return server;

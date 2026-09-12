@@ -69,13 +69,80 @@ MCP_TRANSPORT=stdio npx @modelcontextprotocol/inspector node server.js
 This opens a local UI to list tools and call them directly, useful for
 confirming the Makefile parsing looks right before wiring it into an agent.
 
+For a quicker, non-interactive check — especially useful when a target you
+expect isn't showing up — run:
+
+```bash
+PROJECT_DIR=/path/to/project node server.js --diagnose
+```
+
+This parses that project's Makefile(s) the same way the real server does
+and prints every target it found (and which file each one actually runs
+against), every target the denylist/config blocks and why, and anything it
+had to silently skip while parsing (an unresolvable `$(VAR)` in an
+`include` or `also-read` path, a missing file, a path that resolved
+outside the project) — the causes of the vast majority of "why isn't my
+target showing up" questions. See [`MAKEFILE-GUIDE.md`](./MAKEFILE-GUIDE.md)
+for what to do about each thing it reports.
+
+## Multiple Makefiles (a root Makefile plus e.g. `docker/Makefile`)
+
+make-runner-mcp only ever reads from `<PROJECT_DIR>/Makefile`, but that
+file doesn't have to contain every target itself — three ways to pull in a
+second file's targets are supported, in order of preference:
+
+1. **A real `include`/`-include`/`sinclude` directive** — e.g. `include
+   docker/Makefile` in the root Makefile. This is the normal GNU Make
+   mechanism; use it whenever you can, since it also keeps any variables
+   the root Makefile sets in scope for the included file's recipes.
+2. **The catch-all forwarding idiom** — a bare `%:` rule in the root
+   Makefile whose recipe runs `$(MAKE) -C docker $@`, forwarding any goal
+   not otherwise defined there into `docker/Makefile`. Common when a
+   project genuinely wants two independent Makefiles but still wants `make
+   <anything>` to work uniformly from the root.
+3. **The `## make-runner: also-read docker/Makefile` comment marker** — a
+   fallback for cases 1 and 2 can't cover: an `include` path built from a
+   variable (`include $(ENV).mk`), or a second Makefile that's genuinely
+   separate with no real link to the root one at all. This is a hint read
+   by make-runner-mcp only, with no effect on what `make` itself does —
+   the linked file's targets are then run directly against that file, from
+   its own directory, so they won't see variables the root Makefile sets.
+
+Run `--diagnose` (above) after adding any of these to confirm the targets
+you expect actually show up.
+
+### Fixing it automatically, not just diagnosing it
+
+The procedure above (find every Makefile, work out which ones
+make-runner-mcp can't currently see, add the `also-read` marker for them)
+is written once, at [`skills/fix-makefile-links/SKILL.md`](./skills/fix-makefile-links/SKILL.md),
+and reachable two ways:
+
+- **Already connected to this server** (the normal case — no extra setup):
+  it's exposed as an MCP **prompt** named `fix-makefile-links`. Any
+  MCP client that supports prompts (Claude Code's `/mcp` prompt picker,
+  etc.) can pull it straight from the running server — the prompt text
+  comes back with this project's own `PROJECT_DIR`, Makefile path, and a
+  ready-to-run `--diagnose` command already filled in, since the server
+  serving it already knows all three. Nothing to install.
+- **Not using make-runner-mcp as an MCP server here** (e.g. evaluating it,
+  or just want the procedure without wiring up a client): install the same
+  file as a standalone Claude Code skill —
+  `cp -r skills/fix-makefile-links ~/.claude/skills/` (every project) or
+  into a single project's own `.claude/skills/` — then run
+  `/fix-makefile-links`. Slightly more manual (it has to search for a
+  make-runner-mcp checkout itself to run `--diagnose`, rather than already
+  knowing where one is), but requires nothing beyond Claude Code.
+
+Both read the exact same procedure file, so there's one place to update it.
+
 ## Client configs (stdio)
 
 The server is the same everywhere — only the config file and its shape
 differ per client. Things that change between projects/teams:
 
 - `PROJECT_DIR` — the target project's root.
-- `#v2.0.2` — bump this to whatever tag you've actually released. Always
+- `#v2.1.0` — bump this to whatever tag you've actually released. Always
   pin to a release tag, never `#main`: for a tool that executes commands,
   an unpinned branch reference means a bad push could silently change what
   runs on everyone's machine.
@@ -90,7 +157,7 @@ differ per client. Things that change between projects/teams:
   "mcpServers": {
     "makeRunner": {
       "command": "npx",
-      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.2"],
+      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.1.0"],
       "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
@@ -104,13 +171,13 @@ Project-level `.mcp.json` at the repo root (checked in, shared with the team):
   "mcpServers": {
     "makeRunner": {
       "command": "npx",
-      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.2"],
+      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.1.0"],
       "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
 }
 ```
-Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -e MCP_TRANSPORT=stdio -- npx -y github:davindermahal/make-runner-mcp#v2.0.2`
+Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -e MCP_TRANSPORT=stdio -- npx -y github:davindermahal/make-runner-mcp#v2.1.0`
 
 ### Claude Desktop
 `claude_desktop_config.json` (Settings → Developer → Edit Config):
@@ -119,7 +186,7 @@ Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -e MC
   "mcpServers": {
     "makeRunner": {
       "command": "npx",
-      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.2"],
+      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.1.0"],
       "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
@@ -133,7 +200,7 @@ Or via the CLI: `claude mcp add makeRunner -e PROJECT_DIR=/path/to/project -e MC
   "mcpServers": {
     "makeRunner": {
       "command": "npx",
-      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.0.2"],
+      "args": ["-y", "github:davindermahal/make-runner-mcp#v2.1.0"],
       "env": { "PROJECT_DIR": "/path/to/project", "MCP_TRANSPORT": "stdio" }
     }
   }
@@ -165,7 +232,7 @@ on this machine):
 PROJECT_DIR=/path/to/project \
 MCP_HTTP_TOKEN=$(openssl rand -hex 24) \
 MCP_HTTP_PORT=8791 \
-npx -y github:davindermahal/make-runner-mcp#v2.0.2
+npx -y github:davindermahal/make-runner-mcp#v2.1.0
 ```
 
 Generate a real random token (`openssl rand -hex 24` or equivalent) and

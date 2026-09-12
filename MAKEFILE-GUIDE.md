@@ -45,6 +45,41 @@ a `$(...)` variable in its path (e.g. `include $(ENV).mk`), make-runner-mcp
 cannot resolve it either — note this file as **not scanned**, and flag it
 in your final report (§8).
 
+make-runner-mcp also follows the catch-all forwarding idiom automatically
+— a bare `%:` rule whose recipe runs `$(MAKE) -C <dir> ...` — so targets
+only reachable that way don't need anything from this guide either; see
+§2's note on it.
+
+### 1a. When neither `include` nor forwarding actually connects the files
+
+Two cases §1 flags as unresolvable — an include path built from a `$(VAR)`,
+or a second Makefile that's genuinely a separate, independently-invoked
+Makefile with no real `include`/forwarding link to the root one at all —
+mean make-runner-mcp can't discover that file's targets by parsing, because
+real `make -f Makefile <target>` wouldn't find them either. For exactly
+this situation (not as a substitute for a real `include` you could add
+instead — prefer that when it's an option, since it keeps the linked file's
+variables in scope), add a plain comment to the file make-runner-mcp does
+parse:
+
+```makefile
+## make-runner: also-read docker/Makefile
+```
+
+This is a hint to make-runner-mcp only — it has no effect on what `make`
+itself does with this file, so a human running `make docker-stuff` by hand
+sees no change in behavior. One or more space-separated paths are allowed
+on the same line, each resolved relative to the file the comment is in
+(same resolution rule as `include`). A target found this way is executed
+directly against that other file (`make -f docker/Makefile <target>`, run
+from `docker/`'s own directory) rather than through the root Makefile — so
+it will **not** see variables the root Makefile sets for it (unlike a real
+`include`), and its own tool description in the MCP tool list will say
+`via docker/Makefile` so a calling agent knows it's a separate file. If a
+target's recipe actually depends on a variable only the root Makefile
+defines, this marker isn't the right fix — restructure so that variable is
+set inside the linked file itself, or use a real `include` instead.
+
 ## 2. Detect the incompatible pattern
 
 Run this across the root Makefile and every included file you found in
