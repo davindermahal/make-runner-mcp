@@ -1,6 +1,6 @@
 {
   "name": "make-runner-mcp",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "type": "module",
   "description": "Scoped MCP server that discovers a project's Makefile targets and exposes each one as an individual MCP tool.",
   "main": "server.js",

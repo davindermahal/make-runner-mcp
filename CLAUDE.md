@@ -74,20 +74,22 @@ Dual distribution: the GitHub tag path above (still fully supported, no
 setup needed) and npm, the latter auto-published by
 `.github/workflows/release.yml` via OIDC trusted publishing when a
 `v<semver>` tag is pushed — no `NPM_TOKEN` secret, no local `npm publish`.
-A local `npm publish` bypasses that gate — don't use it once trusted
-publishing is set up (the one exception is the bootstrap step below).
+A local `npm publish` bypasses that gate — don't use it; the one-time
+bootstrap below is already done (first manual publish was v2.1.0, Trusted
+Publisher configured on npmjs.com naming this repo + `release.yml`), so
+every tag push from here on publishes automatically.
 
-**One-time bootstrap, not yet done as of this writing:** npm's trusted
+**One-time bootstrap (historical, already done):** npm's trusted
 publishing can only be configured for a package that already exists on
 the registry — there's no way to pre-register a trusted publisher for a
-name that's never been published. So the very first publish has to be a
-manual, logged-in `npm publish` from someone's machine, at whatever
-`package.json` version is current at the time. Only after that one manual
-publish can a Trusted Publisher be added on the package's npmjs.com
-settings page, naming this exact repo (`davindermahal/make-runner-mcp`)
-and this exact workflow filename (`release.yml`) — until that's done, a
-pushed tag will run `release.yml`, but its `npm publish` step will fail
-with an auth error, not silently no-op.
+name that's never been published. So the very first publish had to be a
+manual, logged-in `npm publish`, at whatever `package.json` version was
+current at the time (v2.1.0). Only after that could a Trusted Publisher be
+added on the package's npmjs.com settings page, naming this exact repo
+(`davindermahal/make-runner-mcp`) and this exact workflow filename
+(`release.yml`). If this package is ever renamed or republished under a
+different npm name, this whole bootstrap has to happen again for the new
+name.
 
 1. `npm version <patch|minor|major> --no-git-tag-version` — bumps
    `"version"` in both `package.json` *and* `package-lock.json` together.
